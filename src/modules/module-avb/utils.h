@@ -1,5 +1,7 @@
 /* AVB support */
 /* SPDX-FileCopyrightText: Copyright © 2022 Wim Taymans */
+/* SPDX-FileCopyrightText: Copyright © 2025 Kebag-Logic */
+/* SPDX-FileCopyrightText: Copyright © 2025 Alexandre Malki <alexandre.malki@kebag-logic.com> */
 /* SPDX-License-Identifier: MIT */
 
 #ifndef AVB_UTILS_H
@@ -62,5 +64,11 @@ static inline int avb_utils_parse_addr(const char *str, int len, uint8_t addr[6]
 	memcpy(addr, v, 6);
 	return 0;
 }
+
+static inline void unaligned_copy_u32(void *dest, uint32_t src) {
+	memcpy(dest, &src, sizeof(uint32_t));
+}
+
+#define ARRAY_SIZE(x) (sizeof(x) / sizeof(x[0]))
 
 #endif /* AVB_UTILS_H */

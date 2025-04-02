@@ -1,5 +1,8 @@
 /* PipeWire */
 /* SPDX-FileCopyrightText: Copyright © 2022 Wim Taymans */
+/* SPDX-FileCopyrightText: Copyright © 2025 Kebag-Logic */
+/* SPDX-FileCopyrightText: Copyright © 2025 Alexandre Malki <alexandre.malki@kebag-logic.com> */
+/* SPDX-FileCopyrightText: Copyright © 2025 Simon Gapp <simon.gapp@kebag-logic.com> */
 /* SPDX-License-Identifier: MIT */
 
 #include <linux/if_ether.h>
@@ -14,11 +17,9 @@
 
 #include <spa/support/cpu.h>
 #include <spa/debug/mem.h>
-#include <spa/utils/result.h>
 
 #include <pipewire/pipewire.h>
 
-#include "avb.h"
 #include "packets.h"
 #include "internal.h"
 #include "stream.h"
@@ -30,9 +31,18 @@
 #include "msrp.h"
 #include "mvrp.h"
 #include "descriptors.h"
+#include "aecp-state-vars.h"
 #include "utils.h"
+#include "descriptors.h"
 
-#define DEFAULT_INTERVAL	1
+#define DEFAULT_INTERVAL_S	0
+
+#ifdef USE_MILAN
+// Milan ACMP timeouts are at 200ms
+#define DEFAULT_INTERVAL_NS 100000000
+#else
+#define DEFAULT_INTERVAL_NS 500000000
+#endif
 
 #define server_emit(s,m,v,...) spa_hook_list_call(&s->listener_list, struct server_events, m, v, ##__VA_ARGS__)
 #define server_emit_destroy(s)		server_emit(s, destroy, 0)
@@ -40,18 +50,12 @@
 #define server_emit_periodic(s,n)	server_emit(s, periodic, 0, n)
 #define server_emit_command(s,n,c,a,f)	server_emit(s, command, 0, n, c, a, f)
 
-static void on_timer_event(void *data)
+static void on_timer_event(void *data, uint64_t expirations)
 {
 	struct server *server = data;
-	struct impl *impl = server->impl;
 	struct timespec now;
-
 	clock_gettime(CLOCK_REALTIME, &now);
 	server_emit_periodic(server, SPA_TIMESPEC_TO_NSEC(&now));
-
-	pw_timer_queue_add(impl->timer_queue, &server->timer,
-		&server->timer.timeout, DEFAULT_INTERVAL * SPA_NSEC_PER_SEC,
-		on_timer_event, server);
 }
 
 static void on_socket_data(void *data, int fd, uint32_t mask)
@@ -161,14 +165,8 @@ int avb_server_make_socket(struct server *server, uint16_t type, const uint8_t m
 	}
 	memcpy(server->mac_addr, req.ifr_hwaddr.sa_data, sizeof(server->mac_addr));
 
-	server->entity_id = (uint64_t)server->mac_addr[0] << 56 |
-			(uint64_t)server->mac_addr[1] << 48 |
-			(uint64_t)server->mac_addr[2] << 40 |
-			(uint64_t)0xff << 32 |
-			(uint64_t)0xfe << 24 |
-			(uint64_t)server->mac_addr[3] << 16 |
-			(uint64_t)server->mac_addr[4] << 8 |
-			(uint64_t)server->mac_addr[5];
+	// TODO: Replaced MAC Address witht static value.
+	server->entity_id = (uint64_t)DSC_ENTITY_MODEL_ENTITY_ID;
 
 	spa_zero(sll);
 	sll.sll_family = AF_PACKET;
@@ -208,6 +206,7 @@ static int setup_socket(struct server *server)
 	struct impl *impl = server->impl;
 	int fd, res;
 	static const uint8_t bmac[6] = AVB_BROADCAST_MAC;
+	struct timespec value, interval;
 
 	fd = avb_server_make_socket(server, AVB_TSN_ETH, bmac);
 	if (fd < 0)
@@ -221,13 +220,18 @@ static int setup_socket(struct server *server)
 		pw_log_error("server %p: can't create server source: %m", impl);
 		goto error_no_source;
 	}
-
-	if ((res = pw_timer_queue_add(impl->timer_queue, &server->timer,
-			NULL, DEFAULT_INTERVAL * SPA_NSEC_PER_SEC,
-			on_timer_event, server)) < 0) {
-		pw_log_error("server %p: can't create timer: %s", impl, spa_strerror(res));
+	server->timer = pw_loop_add_timer(impl->loop, on_timer_event, server);
+	if (server->timer == NULL) {
+		res = -errno;
+		pw_log_error("server %p: can't create timer source: %m", impl);
 		goto error_no_timer;
 	}
+	value.tv_sec = 0;
+	value.tv_nsec = 1;
+	interval.tv_sec = DEFAULT_INTERVAL_S;
+	interval.tv_nsec = DEFAULT_INTERVAL_NS;
+	pw_loop_update_timer(impl->loop, server->timer, &value, &interval, false);
+
 	return 0;
 
 error_no_timer:
@@ -241,6 +245,7 @@ error_no_source:
 struct server *avdecc_server_new(struct impl *impl, struct spa_dict *props)
 {
 	struct server *server;
+	struct avb_aecp* _aecp;
 	const char *str;
 	int res = 0;
 
@@ -263,16 +268,19 @@ struct server *avdecc_server_new(struct impl *impl, struct spa_dict *props)
 
 	init_descriptors(server);
 
+
 	server->mrp = avb_mrp_new(server);
 	if (server->mrp == NULL)
 		goto error_free;
 
-	avb_aecp_register(server);
+	_aecp = avb_aecp_register(server);
+	init_aecp_state_vars((struct aecp *) _aecp);
+
 	server->maap = avb_maap_register(server);
 	server->mmrp = avb_mmrp_register(server);
 	server->msrp = avb_msrp_register(server);
 	server->mvrp = avb_mvrp_register(server);
-	avb_adp_register(server);
+	server->adp  = avb_adp_register(server);
 	avb_acmp_register(server);
 
 	server->domain_attr = avb_msrp_attribute_new(server->msrp,
@@ -311,7 +319,13 @@ void avdecc_server_free(struct server *server)
 	spa_list_remove(&server->link);
 	if (server->source)
 		pw_loop_destroy_source(impl->loop, server->source);
-	pw_timer_queue_cancel(&server->timer);
+	if (server->timer)
+		pw_loop_destroy_source(impl->loop, server->timer);
 	spa_hook_list_clean(&server->listener_list);
 	free(server);
+}
+
+void avdecc_server_access_lock(struct server *server)
+{
+	// TODO a way to have a single point of lock for ease of debugging.
 }

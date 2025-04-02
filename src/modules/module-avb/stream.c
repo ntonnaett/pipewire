@@ -1,5 +1,8 @@
 /* AVB support */
 /* SPDX-FileCopyrightText: Copyright © 2022 Wim Taymans */
+/* SPDX-FileCopyrightText: Copyright © 2025 Kebag-Logic */
+/* SPDX-FileCopyrightText: Copyright © 2025 Alex Malki <alexandre.malki@kebag-logic.com> */
+/* SPDX-FileCopyrightText: Copyright © 2025 Simon Gapp <simon.gapp@kebag-logic.com> */
 /* SPDX-License-Identifier: MIT */
 
 #include <unistd.h>
@@ -13,6 +16,7 @@
 #include <spa/pod/builder.h>
 #include <spa/param/audio/format-utils.h>
 
+#include "aaf.h"
 #include "iec61883.h"
 #include "stream.h"
 #include "utils.h"
@@ -87,20 +91,30 @@ static int flush_write(struct stream *stream, uint64_t current_time)
 {
 	int32_t avail;
 	uint32_t index;
-        uint64_t ptime, txtime;
+	uint64_t ptime, txtime;
 	int pdu_count;
 	ssize_t n;
 	struct avb_frame_header *h = (void*)stream->pdu;
+#ifdef USE_MILAN
+	struct avb_packet_aaf *p = SPA_PTROFF(h, sizeof(*h), void);
+#else
 	struct avb_packet_iec61883 *p = SPA_PTROFF(h, sizeof(*h), void);
 	uint8_t dbc;
+#endif
 
 	avail = spa_ringbuffer_get_read_index(&stream->ring, &index);
 
 	pdu_count = (avail / stream->stride) / stream->frames_per_pdu;
-
-	txtime = current_time + stream->t_uncertainty;
+	if (!pdu_count) {
+		pw_log_error("not enough\n");
+		return 0;
+	}
+	// the t_uncertainty is 0 for now
+	txtime = stream->stream_start + stream->t_uncertainty;
 	ptime = txtime + stream->mtt;
+#ifndef USE_MILAN
 	dbc = stream->dbc;
+#endif
 
 	while (pdu_count--) {
 		*(uint64_t*)CMSG_DATA(stream->cmsg) = txtime;
@@ -113,8 +127,11 @@ static int flush_write(struct stream *stream, uint64_t current_time)
 
 		p->seq_num = stream->pdu_seq++;
 		p->tv = 1;
-		p->timestamp = ptime;
+		// the timestamp is not 64 but 32 bit, there will be some head trunc
+		p->timestamp = htonl(ptime); // use to be ptime
+#ifndef USE_MILAN
 		p->dbc = dbc;
+#endif
 
 		n = sendmsg(stream->source->fd, &stream->msg, MSG_NOSIGNAL);
 		if (n < 0 || n != (ssize_t)stream->pdu_size) {
@@ -124,9 +141,14 @@ static int flush_write(struct stream *stream, uint64_t current_time)
 		txtime += stream->pdu_period;
 		ptime += stream->pdu_period;
 		index += stream->payload_size;
+		stream->stream_start += stream->pdu_period;
+#ifndef USE_MILAN
 		dbc += stream->frames_per_pdu;
+#endif
 	}
+#ifndef USE_MILAN
 	stream->dbc = dbc;
+#endif
 	spa_ringbuffer_read_update(&stream->ring, index);
 	return 0;
 }
@@ -138,6 +160,7 @@ static void on_sink_stream_process(void *data)
 	struct spa_data *d;
 	int32_t filled;
 	uint32_t index, offs, avail, size;
+	uint64_t time_now;
 	struct timespec now;
 
 	if ((buf = pw_stream_dequeue_buffer(stream->stream)) == NULL) {
@@ -165,15 +188,25 @@ static void on_sink_stream_process(void *data)
 		spa_ringbuffer_write_update(&stream->ring, index);
 	}
 	pw_stream_queue_buffer(stream->stream, buf);
-
 	clock_gettime(CLOCK_TAI, &now);
-	flush_write(stream, SPA_TIMESPEC_TO_NSEC(&now));
+
+	time_now = SPA_TIMESPEC_TO_NSEC(&now);
+	if (time_now - stream->stream_start > 1000000000) {
+		stream->stream_start = time_now;
+	}
+
+	flush_write(stream, time_now);
 }
 
 static void setup_pdu(struct stream *stream)
 {
+	// TODO: This should be dependant on the AEM description of the stream.
 	struct avb_frame_header *h;
+#ifdef USE_MILAN
+	struct avb_packet_aaf *p;
+#else
 	struct avb_packet_iec61883 *p;
+#endif
 	ssize_t payload_size, hdr_size, pdu_size;
 
 	spa_memzero(stream->pdu, sizeof(stream->pdu));
@@ -189,10 +222,20 @@ static void setup_pdu(struct stream *stream)
 	h->etype = htons(0x22f0);
 
 	if (stream->direction == SPA_DIRECTION_OUTPUT) {
-		p->subtype = AVB_SUBTYPE_61883_IIDC;
+		p->subtype = AVB_SUBTYPE_AAF;
 		p->sv = 1;
 		p->stream_id = htobe64(stream->id);
-		p->data_len = htons(payload_size+8);
+
+#ifdef USE_MILAN
+		p->format = AVB_AAF_FORMAT_INT_32BIT;
+		p->nsr = AVB_AAF_PCM_NSR_48KHZ;
+		p->bit_depth = 32;
+		p->chan_per_frame = 8;
+		p->sp = 0;
+		p->event = 0;
+		p->seq_num = 0;
+		p->data_len = htons(payload_size);
+#else
 		p->tag = 0x1;
 		p->channel = 0x1f;
 		p->tcode = 0xa;
@@ -202,6 +245,8 @@ static void setup_pdu(struct stream *stream)
 		p->format_id = 0x10;
 		p->fdf = 0x2;
 		p->syt = htons(0x0008);
+		p->data_len = htons(payload_size+8);
+#endif
 	}
 	stream->hdr_size = hdr_size;
 	stream->payload_size = payload_size;
@@ -287,7 +332,7 @@ struct stream *server_create_stream(struct server *server,
 			pw_properties_new(
 				PW_KEY_MEDIA_CLASS, "Audio/Source",
 				PW_KEY_NODE_NAME, "avb.source",
-				PW_KEY_NODE_DESCRIPTION, "AVB Source",
+				PW_KEY_NODE_DESCRIPTION, "AVB Milan Source",
 				PW_KEY_NODE_WANT_DRIVER, "true",
 				NULL));
 	} else {
@@ -295,7 +340,7 @@ struct stream *server_create_stream(struct server *server,
 			pw_properties_new(
 				PW_KEY_MEDIA_CLASS, "Audio/Sink",
 				PW_KEY_NODE_NAME, "avb.sink",
-				PW_KEY_NODE_DESCRIPTION, "AVB Sink",
+				PW_KEY_NODE_DESCRIPTION, "AVB Milan Sink",
 				PW_KEY_NODE_WANT_DRIVER, "true",
 				NULL));
 	}
@@ -309,10 +354,21 @@ struct stream *server_create_stream(struct server *server,
 				&sink_stream_events,
 			stream);
 
-	stream->info.info.raw.format = SPA_AUDIO_FORMAT_S24_32_BE;
+	//TODO find if this is valid  {
+	if (direction == SPA_DIRECTION_INPUT) {
+		stream->info.info.raw.format = SPA_AUDIO_FORMAT_S32_BE;
+	} else {
+		stream->info.info.raw.format = SPA_AUDIO_FORMAT_S32_BE;
+	}
 	stream->info.info.raw.flags = SPA_AUDIO_FLAG_UNPOSITIONED;
 	stream->info.info.raw.rate = 48000;
-	stream->info.info.raw.channels = 8;
+	// TODO find the value from the descriptor
+	if (direction == SPA_DIRECTION_INPUT) {
+		// FIXME!11!! A Hacky hack for 4 channel output streams to work
+		stream->info.info.raw.channels = 4;
+	} else {
+		stream->info.info.raw.channels = 8;
+	}
 	stream->stride = stream->info.info.raw.channels * 4;
 
 	n_params = 0;
@@ -329,6 +385,7 @@ struct stream *server_create_stream(struct server *server,
 			params, n_params)) < 0)
 		goto error_free_stream;
 
+	// TODO find this from the descriptor
 	stream->frames_per_pdu = 6;
 	stream->pdu_period = SPA_NSEC_PER_SEC * stream->frames_per_pdu /
                           stream->info.info.raw.rate;
@@ -341,12 +398,16 @@ struct stream *server_create_stream(struct server *server,
 	stream->talker_attr = avb_msrp_attribute_new(server->msrp,
 			AVB_MSRP_ATTRIBUTE_TYPE_TALKER_ADVERTISE);
 	stream->talker_attr->attr.talker.vlan_id = htons(stream->vlan_id);
-	stream->talker_attr->attr.talker.tspec_max_frame_size = htons(32 + stream->frames_per_pdu * stream->stride);
+	// TODO fix, make sure to only use the necessary bandwidth
+	// TODO test and change for sizeof(struct avb_packet_aaf)
+	stream->talker_attr->attr.talker.tspec_max_frame_size = htons(24 + 1 + stream->frames_per_pdu * stream->stride);
 	stream->talker_attr->attr.talker.tspec_max_interval_frames =
 		htons(AVB_MSRP_TSPEC_MAX_INTERVAL_FRAMES_DEFAULT);
 	stream->talker_attr->attr.talker.priority = stream->prio;
 	stream->talker_attr->attr.talker.rank = AVB_MSRP_RANK_DEFAULT;
-	stream->talker_attr->attr.talker.accumulated_latency = htonl(95);
+
+	// TODO Figure a way to retrieve such a value., this is too low
+	stream->talker_attr->attr.talker.accumulated_latency = htonl(130829);
 
 	return stream;
 
@@ -379,29 +440,34 @@ static int setup_socket(struct stream *stream)
 	}
 
 	spa_zero(req);
-	snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", server->ifname);
+	if (stream->direction == SPA_DIRECTION_OUTPUT) {
+		snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", server->ifname);
+	}
+	 else {
+		snprintf(req.ifr_name, sizeof(req.ifr_name), "%s.2", server->ifname);
+	}
+
 	res = ioctl(fd, SIOCGIFINDEX, &req);
 	if (res < 0) {
 		pw_log_error("SIOCGIFINDEX %s failed: %m", server->ifname);
 		res = -errno;
 		goto error_close;
 	}
-
 	spa_zero(stream->sock_addr);
 	stream->sock_addr.sll_family = AF_PACKET;
 	stream->sock_addr.sll_protocol = htons(ETH_P_TSN);
 	stream->sock_addr.sll_ifindex = req.ifr_ifindex;
 
+	res = setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &stream->prio,
+		sizeof(stream->prio));
+	if (res < 0) {
+		pw_log_error("setsockopt(SO_PRIORITY %d) failed: %m", stream->prio);
+		res = -errno;
+		goto error_close;
+	}
+
 	if (stream->direction == SPA_DIRECTION_OUTPUT) {
 		struct sock_txtime txtime_cfg;
-
-		res = setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &stream->prio,
-				sizeof(stream->prio));
-		if (res < 0) {
-			pw_log_error("setsockopt(SO_PRIORITY %d) failed: %m", stream->prio);
-			res = -errno;
-			goto error_close;
-		}
 
 		txtime_cfg.clockid = CLOCK_TAI;
 		txtime_cfg.flags = 0;
@@ -430,6 +496,7 @@ static int setup_socket(struct stream *stream)
 		res = setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
 				&mreq, sizeof(struct packet_mreq));
 
+
 		pw_log_info("join %s", avb_utils_format_addr(buf, 128, stream->addr));
 
 		if (res < 0) {
@@ -443,6 +510,29 @@ static int setup_socket(struct stream *stream)
 error_close:
 	close(fd);
 	return res;
+}
+
+static void handle_aaf_packet(struct stream *stream,
+		struct avb_packet_aaf *p, int len)
+{
+	// pw_log_info("AAF handling");
+	uint32_t index, n_bytes;
+	int32_t filled;
+
+	filled = spa_ringbuffer_get_write_index(&stream->ring, &index);
+	n_bytes = ntohs(p->data_len);
+
+	if (filled + n_bytes > stream->buffer_size) {
+		pw_log_debug("capture overrun");
+	} else {
+		spa_ringbuffer_write_data(&stream->ring,
+				stream->buffer_data,
+				stream->buffer_size,
+				index % stream->buffer_size,
+				p->payload, n_bytes);
+		index += n_bytes;
+		spa_ringbuffer_write_update(&stream->ring, index);
+	}
 }
 
 static void handle_iec61883_packet(struct stream *stream,
@@ -470,6 +560,7 @@ static void handle_iec61883_packet(struct stream *stream,
 static void on_socket_data(void *data, int fd, uint32_t mask)
 {
 	struct stream *stream = data;
+	// pw_log_info("Data on socket: 0x%" PRIx64, stream->peer_id);
 
 	if (mask & SPA_IO_IN) {
 		int len;
@@ -480,18 +571,30 @@ static void on_socket_data(void *data, int fd, uint32_t mask)
 		if (len < 0) {
 			pw_log_warn("got recv error: %m");
 		}
-		else if (len < (int)sizeof(struct avb_packet_header)) {
+		else if (len < (int)sizeof(struct avb_frame_header_vlan_stripped)) {
 			pw_log_warn("short packet received (%d < %d)", len,
-					(int)sizeof(struct avb_packet_header));
+					(int)sizeof(struct avb_frame_header_vlan_stripped));
 		} else {
-			struct avb_frame_header *h = (void*)buffer;
-			struct avb_packet_iec61883 *p = SPA_PTROFF(h, sizeof(*h), void);
-
-			if (memcmp(h->dest, stream->addr, 6) != 0 ||
-			    p->subtype != AVB_SUBTYPE_61883_IIDC)
+			struct avb_frame_header_vlan_stripped *h = (void*)buffer;
+			struct avb_packet_aaf *p = SPA_PTROFF(h, sizeof(*h), void);
+			if (memcmp(h->dest, stream->addr, 6) != 0) {
 				return;
+			}
 
-			handle_iec61883_packet(stream, p, len - sizeof(*h));
+			switch (p->subtype)  {
+				case AVB_SUBTYPE_61883_IIDC: {
+						struct avb_packet_iec61883 *p = SPA_PTROFF(h, sizeof(*h), void);
+						handle_iec61883_packet(stream, p, len - sizeof(*h));
+					}
+					break;
+				case AVB_SUBTYPE_AAF: {
+						handle_aaf_packet(stream, p,  len - sizeof(*h));
+					}
+					break;
+				default:
+					pw_log_warn("Unsupported subtype %x\n", p->subtype);
+					break;
+			}
 		}
 	}
 }
@@ -501,8 +604,9 @@ int stream_activate(struct stream *stream, uint64_t now)
 	struct server *server = stream->server;
 	struct avb_frame_header *h = (void*)stream->pdu;
 	int fd, res;
-
+	pw_log_info("Activate data");
 	if (stream->source == NULL) {
+		pw_log_info("Setting up source and socket");
 		if ((fd = setup_socket(stream)) < 0)
 			return fd;
 
@@ -515,10 +619,8 @@ int stream_activate(struct stream *stream, uint64_t now)
 			return res;
 		}
 	}
-
 	avb_mrp_attribute_begin(stream->vlan_attr->mrp, now);
 	avb_mrp_attribute_join(stream->vlan_attr->mrp, now, true);
-
 	if (stream->direction == SPA_DIRECTION_INPUT) {
 		stream->listener_attr->attr.listener.stream_id = htobe64(stream->peer_id);
 		stream->listener_attr->param = AVB_MSRP_LISTENER_PARAM_READY;
@@ -531,10 +633,6 @@ int stream_activate(struct stream *stream, uint64_t now)
 		if ((res = avb_maap_get_address(server->maap, stream->addr, stream->index)) < 0)
 			return res;
 
-		stream->listener_attr->attr.listener.stream_id = htobe64(stream->id);
-		stream->listener_attr->param = AVB_MSRP_LISTENER_PARAM_IGNORE;
-		avb_mrp_attribute_begin(stream->listener_attr->mrp, now);
-
 		stream->talker_attr->attr.talker.stream_id = htobe64(stream->id);
 		memcpy(stream->talker_attr->attr.talker.dest_addr, stream->addr, 6);
 
@@ -544,6 +642,10 @@ int stream_activate(struct stream *stream, uint64_t now)
 		memcpy(h->src, server->mac_addr, 6);
 		avb_mrp_attribute_begin(stream->talker_attr->mrp, now);
 		avb_mrp_attribute_join(stream->talker_attr->mrp, now, true);
+		// TODO retrieve the presentation time, for now the defaault is 2ms
+		stream->mtt = AVB_MILAN_MAX_PTO;
+		// TODO retrieve a way to get the average system latency and multiply it by 2.
+		stream->t_uncertainty = AVB_STREAM_T_UNCERTAINTY;
 	}
 	pw_stream_set_active(stream->stream, true);
 	return 0;
