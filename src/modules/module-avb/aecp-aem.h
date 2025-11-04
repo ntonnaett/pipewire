@@ -147,19 +147,17 @@ struct avb_packet_aecp_aem_setget_sensor_format {
 	uint64_t sensor_format;
 } __attribute__ ((__packed__));
 
-
-#define AVB_AEM_STREAM_INFO_FLAG_CLASS_B			(1u<<0)
-#define AVB_AEM_STREAM_INFO_FLAG_FAST_CONNECT			(1u<<1)
-#define AVB_AEM_STREAM_INFO_FLAG_SAVED_STATE			(1u<<2)
-#define AVB_AEM_STREAM_INFO_FLAG_STREAMING_WAIT			(1u<<3)
-#define AVB_AEM_STREAM_INFO_FLAG_ENCRYPTED_PDU			(1u<<4)
-#define AVB_AEM_STREAM_INFO_FLAG_STREAM_VLAN_ID_VALID		(1u<<25)
-#define AVB_AEM_STREAM_INFO_FLAG_CONNECTED			(1u<<26)
-#define AVB_AEM_STREAM_INFO_FLAG_MSRP_FAILURE_VALID		(1u<<27)
-#define AVB_AEM_STREAM_INFO_FLAG_STREAM_DEST_MAC_VALID		(1u<<28)
-#define AVB_AEM_STREAM_INFO_FLAG_MSRP_ACC_LAT_VALID		(1u<<29)
-#define AVB_AEM_STREAM_INFO_FLAG_STREAM_ID_VALID		(1u<<30)
-#define AVB_AEM_STREAM_INFO_FLAG_STREAM_FORMAT_VALID		(1u<<31)
+/* IEEE 1722.1-2021, Table 8-4 - flags field */
+#define AVB_AEM_STREAM_INFO_FLAG_CLASS_B                   (1u << 0)  // 0x0001
+#define AVB_AEM_STREAM_INFO_FLAG_FAST_CONNECT              (1u << 1)  // 0x0002
+#define AVB_AEM_STREAM_INFO_FLAG_SAVED_STATE               (1u << 2)  // 0x0004
+#define AVB_AEM_STREAM_INFO_FLAG_STREAMING_WAIT            (1u << 3)  // 0x0008
+#define AVB_AEM_STREAM_INFO_FLAG_SUPPORTS_ENCRYPTED        (1u << 4)  // 0x0010
+#define AVB_AEM_STREAM_INFO_FLAG_ENCRYPTED_PDU             (1u << 5)  // 0x0020
+#define AVB_AEM_STREAM_INFO_FLAG_SRP_REGISTRATION_FAILED   (1u << 6)  // 0x0040
+#define AVB_AEM_STREAM_INFO_FLAG_CL_ENTRIES_VALID          (1u << 7)  // 0x0080
+#define AVB_AEM_STREAM_INFO_FLAG_NO_SRP                    (1u << 8)  // 0x0100
+#define AVB_AEM_STREAM_INFO_FLAG_UDP                       (1u << 9)  // 0x0200
 
 struct avb_packet_aecp_aem_setget_stream_info {
 	uint16_t descriptor_type;

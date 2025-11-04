@@ -7,6 +7,9 @@
 
 #include "internal.h"
 
+/*
+* IEEE 1722.1-2021, Table 7-1 - Descriptor Types
+*/
 #define AVB_AEM_DESC_ENTITY			0x0000
 #define AVB_AEM_DESC_CONFIGURATION		0x0001
 #define AVB_AEM_DESC_AUDIO_UNIT			0x0002
@@ -45,6 +48,11 @@
 #define AVB_AEM_DESC_SIGNAL_TRANSCODER		0x0023
 #define AVB_AEM_DESC_CLOCK_DOMAIN		0x0024
 #define AVB_AEM_DESC_CONTROL_BLOCK		0x0025
+#define AVB_AEM_DESC_TIMING				0x0026
+#define AVB_AEM_DESC_PTP_INSTANCE		0x0027
+#define AVB_AEM_DESC_PTP_PORT			0x0028
+#define AVB_AEM_DESC_MAX_17221   		0x0029
+
 #define AVB_AEM_DESC_INVALID			0xffff
 
 struct avb_aem_desc_entity {
